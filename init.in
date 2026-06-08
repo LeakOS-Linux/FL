@@ -1,0 +1,398 @@
+#!/bin/sh
+# LeakOS Live Initramfs Init Script
+# Tujuan: Mount squashfs + overlay, lalu switch_root ke init sebenarnya
+
+export PATH=/usr/bin:/usr/sbin:/bin:/sbin
+export HOME=/
+
+# Konfigurasi
+ROOT_MNT="/newroot"
+BOOT_MNT="/bootmnt"
+SQUASH_MNT="/squashfs"
+OVERLAY_UPPER="/cow/upper"
+OVERLAY_WORK="/cow/work"
+DEBUG=false
+
+# Warna untuk output (jika terminal mendukung)
+if [ -t 1 ]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    NC='\033[0m'
+else
+    RED=''; GREEN=''; YELLOW=''; NC=''
+fi
+
+log_msg() {
+    echo "${GREEN}[INIT]${NC} $*" > /dev/kmsg 2>/dev/null || echo "[INIT] $*"
+}
+
+error_msg() {
+    echo "${RED}[ERROR]${NC} $*" > /dev/kmsg 2>/dev/null || echo "[ERROR] $*"
+}
+
+warn_msg() {
+    echo "${YELLOW}[WARN]${NC} $*" > /dev/kmsg 2>/dev/null || echo "[WARN] $*"
+}
+
+emergency_shell() {
+    echo ""
+    echo "${RED}========================================${NC}"
+    echo "${RED}  EMERGENCY SHELL${NC}"
+    echo "${RED}========================================${NC}"
+    echo "Kernel panic atau error terjadi."
+    echo "Perintah yang berguna: lsblk, blkid, mount, dmesg, cat /proc/cmdline"
+    echo "========================================${NC}"
+    echo ""
+    exec /bin/sh
+}
+
+# Mount filesystem dasar
+mount_base() {
+    log_msg "Mounting base filesystems..."
+    
+    mount -t devtmpfs devtmpfs /dev 2>/dev/null || error_msg "devtmpfs mount failed"
+    mount -t proc proc /proc 2>/dev/null || error_msg "proc mount failed"
+    mount -t sysfs sysfs /sys 2>/dev/null || error_msg "sysfs mount failed"
+    mount -t tmpfs tmpfs /run 2>/dev/null || warn_msg "tmpfs /run mount failed"
+    mount -t tmpfs tmpfs /tmp 2>/dev/null || warn_msg "tmpfs /tmp mount failed"
+    
+    # /dev/pts untuk pseudo-terminal
+    mkdir -p /dev/pts 2>/dev/null
+    mount -t devpts devpts /dev/pts -o gid=5,mode=620 2>/dev/null || warn_msg "devpts mount failed"
+}
+
+# Load kernel modules
+load_modules() {
+    log_msg "Loading kernel modules..."
+    
+    # Core filesystem modules
+    for mod in squashfs overlay loop; do
+        modprobe -q "$mod" 2>/dev/null || warn_msg "Failed to load $mod"
+    done
+    
+    # Filesystem modules untuk boot media
+    for mod in vfat exfat iso9660 ext4 xfs btrfs; do
+        modprobe -q "$mod" 2>/dev/null
+    done
+    
+    # Storage drivers
+    for mod in usb-storage sr_mod ahci nvme virtio_blk mmc_block; do
+        modprobe -q "$mod" 2>/dev/null
+    done
+    
+    # Host controller
+    for mod in xhci_hcd ehci_hcd uhci_hcd; do
+        modprobe -q "$mod" 2>/dev/null
+    done
+    
+    log_msg "Modules loaded"
+}
+
+# Setup loop devices
+setup_loop_devices() {
+    log_msg "Setting up loop devices..."
+    
+    # Hapus existing loop devices
+    for i in $(seq 0 15); do
+        if [ -b "/dev/loop$i" ]; then
+            losetup -d "/dev/loop$i" 2>/dev/null
+        else
+            mknod -m 660 "/dev/loop$i" b 7 "$i" 2>/dev/null
+        fi
+    done
+    
+    # Maksimum loop devices
+    echo "max_loop=32" > /sys/module/loop/parameters/max_loop 2>/dev/null || true
+}
+
+# Start udev
+start_udev() {
+    log_msg "Starting udev..."
+    
+    # Cari udevd
+    UDEVD=""
+    for p in /usr/lib/systemd/systemd-udevd /usr/lib/udev/udevd /usr/sbin/udevd /sbin/udevd; do
+        if [ -x "$p" ]; then
+            UDEVD="$p"
+            break
+        fi
+    done
+    
+    if [ -z "$UDEVD" ]; then
+        warn_msg "udevd not found, using mdev fallback"
+        mdev -s 2>/dev/null || true
+        return
+    fi
+    
+    # Start udevd
+    $UDEVD --daemon --resolve-names=never 2>/dev/null
+    
+    # Trigger device discovery
+    udevadm trigger --action=add --type=subsystems 2>/dev/null
+    udevadm trigger --action=add --type=devices 2>/dev/null
+    udevadm settle --timeout=30 2>/dev/null
+    
+    log_msg "udev ready"
+}
+
+# Cari boot media yang berisi lfs.squashfs
+find_boot_media() {
+    local timeout=60
+    local elapsed=0
+    
+    log_msg "Searching for boot media (timeout: ${timeout}s)..."
+    
+    mkdir -p "$BOOT_MNT" 2>/dev/null
+    
+    while [ $elapsed -lt $timeout ]; do
+        # Scan semua block devices
+        for dev in $(ls /sys/block/ 2>/dev/null); do
+            case "$dev" in
+                loop*|ram*|dm-*) continue ;;
+            esac
+            
+            # Cek partitions dulu
+            for part in /dev/${dev}p[0-9]* /dev/${dev}[0-9]* 2>/dev/null; do
+                [ -b "$part" ] || continue
+                
+                # Coba mount dengan berbagai filesystem
+                for fstype in iso9660 vfat exfat ext4 ext3 ext2 xfs btrfs; do
+                    if mount -t "$fstype" -o ro "$part" "$BOOT_MNT" 2>/dev/null; then
+                        if [ -f "$BOOT_MNT/boot/lfs.squashfs" ]; then
+                            echo "$part"
+                            return 0
+                        fi
+                        umount "$BOOT_MNT" 2>/dev/null
+                    fi
+                done
+            done
+            
+            # Cek whole disk (untuk superfloppy mode)
+            if [ -b "/dev/$dev" ]; then
+                for fstype in iso9660 vfat exfat; do
+                    if mount -t "$fstype" -o ro "/dev/$dev" "$BOOT_MNT" 2>/dev/null; then
+                        if [ -f "$BOOT_MNT/boot/lfs.squashfs" ]; then
+                            echo "/dev/$dev"
+                            return 0
+                        fi
+                        umount "$BOOT_MNT" 2>/dev/null
+                    fi
+                done
+            fi
+        done
+        
+        sleep 2
+        elapsed=$((elapsed + 2))
+        [ $((elapsed % 10)) -eq 0 ] && log_msg "Still searching... (${elapsed}s)"
+    done
+    
+    return 1
+}
+
+# Mount root filesystem
+mount_root() {
+    local boot_dev
+    
+    log_msg "Mounting root filesystem..."
+    
+    # Buat direktori yang diperlukan
+    mkdir -p "$ROOT_MNT" "$BOOT_MNT" "$SQUASH_MNT" "$OVERLAY_UPPER" "$OVERLAY_WORK"
+    
+    # Cari boot media
+    boot_dev=$(find_boot_media)
+    if [ -z "$boot_dev" ]; then
+        error_msg "Boot media with lfs.squashfs not found!"
+        log_msg "Available block devices:"
+        lsblk 2>/dev/null || cat /proc/partitions
+        return 1
+    fi
+    
+    log_msg "Found boot media: $boot_dev"
+    
+    # Mount boot media (remount jika perlu)
+    if ! mountpoint -q "$BOOT_MNT"; then
+        mount -t auto -o ro "$boot_dev" "$BOOT_MNT" || {
+            error_msg "Failed to mount $boot_dev"
+            return 1
+        }
+    fi
+    
+    # Verifikasi squashfs
+    if [ ! -f "$BOOT_MNT/boot/lfs.squashfs" ]; then
+        error_msg "lfs.squashfs not found in $BOOT_MNT/boot/"
+        ls -la "$BOOT_MNT/boot/" 2>/dev/null
+        return 1
+    fi
+    
+    log_msg "Found lfs.squashfs"
+    
+    # Mount squashfs
+    mount -t squashfs -o loop "$BOOT_MNT/boot/lfs.squashfs" "$SQUASH_MNT" || {
+        error_msg "Failed to mount squashfs"
+        return 1
+    }
+    
+    log_msg "Squashfs mounted at $SQUASH_MNT"
+    
+    # Setup overlay
+    mount -t tmpfs tmpfs /cow 2>/dev/null || {
+        error_msg "Failed to mount tmpfs for overlay"
+        return 1
+    }
+    
+    # Buat struktur overlay
+    mkdir -p "$OVERLAY_UPPER" "$OVERLAY_WORK"
+    mkdir -p "$OVERLAY_UPPER"/{etc,home,root,var,tmp,run,dev,proc,sys}
+    
+    # Mount overlay
+    mount -t overlay overlay -o \
+        lowerdir="$SQUASH_MNT",\
+        upperdir="$OVERLAY_UPPER",\
+        workdir="$OVERLAY_WORK" \
+        "$ROOT_MNT" || {
+        error_msg "Failed to mount overlay"
+        return 1
+    }
+    
+    log_msg "Overlay mounted at $ROOT_MNT"
+    
+    # Bind mount boot media untuk akses nanti
+    mkdir -p "$ROOT_MNT/mnt/bootmedia"
+    mount --bind "$BOOT_MNT" "$ROOT_MNT/mnt/bootmedia" 2>/dev/null
+    
+    # Pindahkan pseudo-filesystems ke new root
+    mount --move /dev "$ROOT_MNT/dev" 2>/dev/null || warn_msg "Failed to move /dev"
+    mount --move /proc "$ROOT_MNT/proc" 2>/dev/null || warn_msg "Failed to move /proc"
+    mount --move /sys "$ROOT_MNT/sys" 2>/dev/null || warn_msg "Failed to move /sys"
+    mount --move /run "$ROOT_MNT/run" 2>/dev/null || warn_msg "Failed to move /run"
+    
+    # Pastikan /dev/pts ada di new root
+    mkdir -p "$ROOT_MNT/dev/pts" 2>/dev/null
+    mount -t devpts devpts "$ROOT_MNT/dev/pts" -o gid=5,mode=620 2>/dev/null
+    
+    # Setup resolv.conf untuk networking
+    if [ ! -f "$ROOT_MNT/etc/resolv.conf" ]; then
+        echo "nameserver 8.8.8.8" > "$ROOT_MNT/etc/resolv.conf"
+        echo "nameserver 1.1.1.1" >> "$ROOT_MNT/etc/resolv.conf"
+    fi
+    
+    log_msg "Root filesystem ready at $ROOT_MNT"
+    return 0
+}
+
+# Cari init yang valid di new root
+find_root_init() {
+    # Priority order untuk init
+    for init in \
+        /sbin/init \
+        /usr/sbin/init \
+        /bin/init \
+        /usr/bin/init \
+        /usr/lib/systemd/systemd \
+        /lib/systemd/systemd \
+        /sbin/openrc-init \
+        /sbin/runit-init \
+        /etc/init \
+        /init
+    do
+        if [ -x "$ROOT_MNT$init" ]; then
+            echo "$init"
+            return 0
+        fi
+    done
+    
+    # Fallback ke /bin/sh
+    if [ -x "$ROOT_MNT/bin/sh" ]; then
+        echo "/bin/sh"
+        return 0
+    fi
+    
+    return 1
+}
+
+# Cleanup sebelum switch_root
+cleanup() {
+    log_msg "Cleaning up..."
+    
+    # Stop udev
+    killall udevd 2>/dev/null
+    killall systemd-udevd 2>/dev/null
+    
+    # Unmount yang tidak perlu
+    umount /dev/pts 2>/dev/null
+    umount /sys 2>/dev/null
+}
+
+# Parse kernel command line
+parse_cmdline() {
+    if [ -r /proc/cmdline ]; then
+        for param in $(cat /proc/cmdline); do
+            case "$param" in
+                debug) DEBUG=true; log_msg "Debug mode enabled" ;;
+                rootdelay=*) 
+                    rootdelay="${param#rootdelay=}"
+                    log_msg "Root delay: ${rootdelay}s"
+                    sleep "$rootdelay"
+                    ;;
+            esac
+        done
+    fi
+}
+
+# ============================================
+# MAIN
+# ============================================
+
+log_msg "=== LeakOS Live Initramfs Starting ==="
+
+# Mount base filesystems
+mount_base
+
+# Parse kernel command line
+parse_cmdline
+
+# Load modules
+load_modules
+
+# Setup loop devices
+setup_loop_devices
+
+# Start udev
+start_udev
+
+# Mount root filesystem
+if ! mount_root; then
+    error_msg "Failed to mount root filesystem"
+    emergency_shell
+    panic "Cannot proceed without root filesystem"
+fi
+
+# Cari init di new root
+ROOT_INIT=$(find_root_init)
+if [ -z "$ROOT_INIT" ]; then
+    error_msg "No valid init found in $ROOT_MNT!"
+    error_msg "Available executables in /sbin:"
+    ls -la "$ROOT_MNT/sbin" 2>/dev/null | head -20
+    error_msg "Available executables in /usr/sbin:"
+    ls -la "$ROOT_MNT/usr/sbin" 2>/dev/null | head -20
+    emergency_shell
+    panic "Cannot find init"
+fi
+
+log_msg "Found root init: $ROOT_INIT"
+
+# Cleanup
+cleanup
+
+# Final log
+log_msg "Switching to new root with init: $ROOT_INIT"
+echo "$ROOT_INIT" > /run/init_path 2>/dev/null || true
+
+# Switch to new root
+exec switch_root "$ROOT_MNT" "$ROOT_INIT"
+
+# Jika sampai sini, switch_root gagal
+error_msg "switch_root failed!"
+emergency_shell
+panic "switch_root failed"
