@@ -1,14 +1,11 @@
 #!/bin/sh
 # LeakOS Live Initramfs Init Script
-# Fixed version - handles custom /sbin/init ELF crash
+# Fixed v3 - mountpoint check, no double mount
 
 export PATH=/usr/bin:/usr/sbin:/bin:/sbin
 export HOME=/
 
-RED=''
-GREEN=''
-YELLOW=''
-NC=''
+OVERRIDE_INIT=""
 
 # ============================================
 # Fungsi utilitas
@@ -35,10 +32,13 @@ emergency_shell() {
     echo "  EMERGENCY SHELL - LeakOS Debug"
     echo "========================================"
     echo "Tips debug:"
-    echo "  lsblk | blkid | mount | dmesg | ls /newroot/sbin"
-    echo "  ldd /newroot/sbin/init"
+    echo "  lsblk | blkid | mount | dmesg"
+    echo "  ls /bootmnt/boot/"
+    echo "  mount -t squashfs -o loop /bootmnt/boot/lfs.squashfs /squashfs"
+    echo "  ls /squashfs"
+    echo "  ls /newroot/sbin/"
     echo "  file /newroot/sbin/init"
-    echo "  cat /proc/cmdline"
+    echo "  ls /newroot/lib/ld-* /newroot/lib64/ld-*"
     echo "========================================"
     echo ""
     exec /bin/sh
@@ -55,15 +55,15 @@ mount_base() {
         mount -t tmpfs tmpfs /dev 2>/dev/null || \
         error "devtmpfs failed"
 
-    mount -t proc proc /proc 2>/dev/null       || error "proc failed"
-    mount -t sysfs sysfs /sys 2>/dev/null      || error "sysfs failed"
-    mount -t tmpfs tmpfs /run 2>/dev/null      || warn "tmpfs /run failed"
-    mount -t tmpfs tmpfs /tmp 2>/dev/null      || warn "tmpfs /tmp failed"
+    mount -t proc proc /proc       2>/dev/null || error "proc failed"
+    mount -t sysfs sysfs /sys      2>/dev/null || error "sysfs failed"
+    mount -t tmpfs tmpfs /run      2>/dev/null || warn "tmpfs /run failed"
+    mount -t tmpfs tmpfs /tmp      2>/dev/null || warn "tmpfs /tmp failed"
 
     mkdir -p /dev/pts 2>/dev/null
     mount -t devpts devpts /dev/pts -o gid=5,mode=620 2>/dev/null || warn "devpts failed"
 
-    # Pastikan /dev/null dan /dev/console ada
+    # Pastikan device node penting ada
     [ -c /dev/null ]    || mknod -m 666 /dev/null    c 1 3
     [ -c /dev/console ] || mknod -m 600 /dev/console c 5 1
     [ -c /dev/tty ]     || mknod -m 666 /dev/tty     c 5 0
@@ -86,7 +86,7 @@ load_modules() {
         modprobe -q "$mod" 2>/dev/null && log "  Loaded: $mod" || warn "  Failed: $mod"
     done
 
-    for mod in vfat exfat iso9660 ext4 xfs btrfs; do
+    for mod in vfat exfat iso9660 ext4 ext3 ext2 xfs btrfs; do
         modprobe -q "$mod" 2>/dev/null
     done
 
@@ -107,7 +107,6 @@ load_modules() {
 
 setup_loop_devices() {
     log "Setting up loop devices..."
-
     for i in 0 1 2 3 4 5 6 7; do
         [ -b "/dev/loop$i" ] || mknod -m 660 "/dev/loop$i" b 7 "$i" 2>/dev/null
     done
@@ -157,7 +156,7 @@ parse_cmdline() {
                 ;;
             init=*)
                 OVERRIDE_INIT="${param#init=}"
-                log "Init override from cmdline: $OVERRIDE_INIT"
+                log "Init override dari cmdline: $OVERRIDE_INIT"
                 ;;
         esac
     done
@@ -187,7 +186,7 @@ find_boot_media() {
                 for fstype in iso9660 vfat exfat ext4 ext3 ext2; do
                     if mount -t "$fstype" -o ro "$part" "$BOOT_MNT" 2>/dev/null; then
                         if [ -f "$BOOT_MNT/boot/lfs.squashfs" ]; then
-                            log "Found boot media: $part"
+                            log "Found boot media: $part (partition)"
                             echo "$part"
                             return 0
                         fi
@@ -196,7 +195,7 @@ find_boot_media() {
                 done
             done
 
-            # Cek whole disk
+            # Cek whole disk (optical/superfloppy)
             if [ -b "/dev/$dev" ]; then
                 for fstype in iso9660 udf; do
                     if mount -t "$fstype" -o ro "/dev/$dev" "$BOOT_MNT" 2>/dev/null; then
@@ -220,7 +219,7 @@ find_boot_media() {
 }
 
 # ============================================
-# Verifikasi ELF binary dan dependencies
+# Verifikasi ELF binary
 # ============================================
 
 verify_elf() {
@@ -243,9 +242,9 @@ verify_elf() {
             error "  MISSING dynamic linker: ${root}${interp}"
             return 1
         fi
-        log "  Dynamic linker OK: ${root}${interp}"
+        log "  Dynamic linker OK"
     else
-        log "  Static binary (no dynamic linker needed)"
+        log "  Static binary"
     fi
 
     return 0
@@ -276,20 +275,28 @@ mount_root() {
 
     log "Boot device: $BOOT_DEV"
 
-    # Mount boot media
-    if ! mount -t auto -o ro "$BOOT_DEV" "$BOOT_MNT"; then
-        error "Gagal mount $BOOT_DEV"
-        return 1
+    # find_boot_media sudah mount ke BOOT_MNT
+    # Cek dulu, jangan double mount
+    if mountpoint -q "$BOOT_MNT" 2>/dev/null; then
+        log "Boot media sudah termount di $BOOT_MNT, skip mount ulang"
+    else
+        log "Mounting boot media..."
+        if ! mount -t auto -o ro "$BOOT_DEV" "$BOOT_MNT"; then
+            error "Gagal mount $BOOT_DEV"
+            return 1
+        fi
     fi
 
-    log "Boot media mounted di $BOOT_MNT"
+    log "Boot media OK di $BOOT_MNT"
 
-    # Verifikasi squashfs ada
+    # Verifikasi lfs.squashfs
     if [ ! -f "$BOOT_MNT/boot/lfs.squashfs" ]; then
-        error "lfs.squashfs tidak ada di $BOOT_MNT/boot/"
+        error "lfs.squashfs tidak ditemukan di $BOOT_MNT/boot/"
         ls -la "$BOOT_MNT/boot/" 2>/dev/null
         return 1
     fi
+
+    log "lfs.squashfs ditemukan"
 
     # Mount squashfs
     if ! mount -t squashfs -o loop "$BOOT_MNT/boot/lfs.squashfs" "$SQUASH_MNT"; then
@@ -299,7 +306,13 @@ mount_root() {
 
     log "Squashfs mounted di $SQUASH_MNT"
 
-    # Mount tmpfs untuk overlay
+    # Verifikasi squashfs tidak kosong
+    if [ -z "$(ls -A $SQUASH_MNT 2>/dev/null)" ]; then
+        error "Squashfs kosong setelah mount!"
+        return 1
+    fi
+
+    # Mount tmpfs untuk overlay (writable layer)
     if ! mount -t tmpfs -o mode=755 tmpfs "$COW_DIR"; then
         error "Gagal mount tmpfs untuk overlay"
         return 1
@@ -317,7 +330,7 @@ mount_root() {
 
     log "Overlay mounted di $ROOT_MNT"
 
-    # Bind mount boot media
+    # Bind mount boot media ke dalam rootfs
     mkdir -p "$ROOT_MNT/mnt/bootmedia" 2>/dev/null
     mount --bind "$BOOT_MNT" "$ROOT_MNT/mnt/bootmedia" 2>/dev/null || \
         warn "Gagal bind mount boot media"
@@ -342,24 +355,45 @@ mount_root() {
 }
 
 # ============================================
+# Dump info debug rootfs
+# ============================================
+
+dump_rootfs_info() {
+    local ROOT_MNT="$1"
+
+    log "=== DEBUG ROOTFS INFO ==="
+    log "Isi $ROOT_MNT/sbin/:"
+    ls -la "$ROOT_MNT/sbin/" 2>/dev/null | head -20
+
+    log "Dynamic linker di rootfs:"
+    ls "$ROOT_MNT/lib/"ld-*     2>/dev/null
+    ls "$ROOT_MNT/lib64/"ld-*   2>/dev/null
+    ls "$ROOT_MNT/usr/lib/"ld-* 2>/dev/null
+
+    log "file /sbin/init:"
+    file "$ROOT_MNT/sbin/init" 2>/dev/null || log "(file command tidak tersedia)"
+    log "=== END DEBUG INFO ==="
+}
+
+# ============================================
 # Cari dan verifikasi init di new root
 # ============================================
 
 find_root_init() {
     local ROOT_MNT="$1"
 
-    # Jika ada override dari cmdline
+    # Override dari cmdline (init=/path)
     if [ -n "$OVERRIDE_INIT" ]; then
         if [ -x "$ROOT_MNT$OVERRIDE_INIT" ]; then
             log "Using cmdline init: $OVERRIDE_INIT"
             echo "$OVERRIDE_INIT"
             return 0
         else
-            error "Override init tidak ditemukan: $ROOT_MNT$OVERRIDE_INIT"
+            error "Override init tidak ada: $ROOT_MNT$OVERRIDE_INIT"
         fi
     fi
 
-    # Cek kandidat init
+    # Cek kandidat init secara berurutan
     for init in \
         /sbin/init \
         /usr/sbin/init \
@@ -372,14 +406,12 @@ find_root_init() {
     do
         if [ -x "$ROOT_MNT$init" ]; then
             log "Checking init candidate: $init"
-
-            # Verifikasi ELF dan dependencies
             if verify_elf "$ROOT_MNT$init" "$ROOT_MNT"; then
                 log "Init valid: $init"
                 echo "$init"
                 return 0
             else
-                warn "Init $init gagal verifikasi, coba kandidat lain..."
+                warn "Init $init gagal verifikasi, skip..."
             fi
         fi
     done
@@ -392,28 +424,6 @@ find_root_init() {
     fi
 
     return 1
-}
-
-# ============================================
-# Dump info debug rootfs
-# ============================================
-
-dump_rootfs_info() {
-    local ROOT_MNT="$1"
-
-    log "=== DEBUG INFO ROOTFS ==="
-    log "Isi /sbin:"
-    ls -la "$ROOT_MNT/sbin/" 2>/dev/null | head -20
-
-    log "Isi /lib (dynamic linker):"
-    ls "$ROOT_MNT/lib/"ld-* 2>/dev/null
-    ls "$ROOT_MNT/lib64/"ld-* 2>/dev/null
-    ls "$ROOT_MNT/usr/lib/"ld-* 2>/dev/null
-
-    log "file /sbin/init:"
-    file "$ROOT_MNT/sbin/init" 2>/dev/null || log "(file command tidak tersedia)"
-
-    log "=== END DEBUG INFO ==="
 }
 
 # ============================================
@@ -448,7 +458,7 @@ if [ -z "$ROOT_MNT" ]; then
     emergency_shell
 fi
 
-# Dump info debug (selalu, untuk bantu diagnosa)
+# Dump debug info
 dump_rootfs_info "$ROOT_MNT"
 
 # Cari init
@@ -457,6 +467,8 @@ if [ -z "$ROOT_INIT" ]; then
     error "Tidak ada init yang valid di $ROOT_MNT!"
     error "Isi /sbin:"
     ls -la "$ROOT_MNT/sbin" 2>/dev/null
+    error "Isi /bin:"
+    ls -la "$ROOT_MNT/bin" 2>/dev/null
     emergency_shell
 fi
 
@@ -466,6 +478,6 @@ log "=== Switching to new root, init: $ROOT_INIT ==="
 
 exec switch_root "$ROOT_MNT" "$ROOT_INIT"
 
-# Jika sampai sini
+# Jika sampai sini, switch_root gagal
 error "switch_root GAGAL!"
 emergency_shell
